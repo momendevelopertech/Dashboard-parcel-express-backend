@@ -1,0 +1,392 @@
+<?php
+
+namespace App\Http\Controllers\Api\v1;
+
+use App\Enums\ShipmentStatusEnum;
+use App\Http\Controllers\Controller;
+use App\Http\Resources\AbnormalityResource;
+use App\Models\Shipment;
+use App\Models\Abnormality;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Storage;
+use Exception;
+
+/**
+ * @OA\Tag(name="Other", description="Abnormality Management")
+ * @OA\Controller(description="Handles abnormality reports for shipments.")
+ */
+class AbnormalityController extends Controller
+{
+
+    /**
+     * @OA\Get(
+     *     path="/abnormalities",
+     *     summary="Retrieve a list of abnormalities.",
+     *     tags={"Other"},
+     *     @OA\Parameter(
+     *         name="type",
+     *         in="query",
+     *         description="Filter by abnormality type (LOST, MISS_SORT, DAMAGED).",
+     *         @OA\Schema(type="string"),
+     *     ),
+     *     @OA\Parameter(
+     *         name="tracking_no",
+     *         in="query",
+     *         description="Filter by shipment tracking number.",
+     *         @OA\Schema(type="string"),
+     *     ),
+     *     @OA\Response(
+     *         response=200,
+     *         description="Abnormalities retrieved successfully.",
+     *     ),
+     *     @OA\Response(
+     *         response=422,
+     *         description="Validation error.",
+     *     ),
+     *     security={{"bearerAuth":{}}}
+     * )
+     */
+    public function index(Request $request)
+    {
+        $request->validate([
+            'type'        => 'nullable|in:LOST,MISS_SORT,DAMAGED',
+            'tracking_no' => 'nullable|string',
+        ]);
+        $query = Abnormality::with('shipment');
+        if ($request->filled('type')) {
+            $query->where('type', $request->input('type'));
+        }
+        if ($request->filled('tracking_no')) {
+            $search = strtolower($request->input('tracking_no'));
+            $query->whereRaw('LOWER(shipment_tracking_no) LIKE ?', ["%{$search}%"]);
+        }
+        $abnormalities = $query
+            ->orderBy('id', 'desc')
+            ->paginate(8);
+        return sendResponse(
+            'Abnormalities retrieved successfully.',
+            new AbnormalityResource($abnormalities)
+        );
+    }
+
+    /**
+     * @OA\Post(
+     *     path="/abnormalities/handle_lost",
+     *     summary="Report an shipment as lost.",
+     *     tags={"Other"},
+     *     @OA\RequestBody(
+     *         required=true,
+     *         @OA\MediaType(
+     *             mediaType="multipart/form-data",
+     *             @OA\Schema(
+     *                 @OA\Property(
+     *                     property="tracking_no",
+     *                     type="string",
+     *                     description="Shipment tracking number (required, exists:shipments,tracking_no)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="notes",
+     *                     type="string",
+     *                     description="Notes about the lost shipment (required, string)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="image",
+     *                     type="file",
+     *                     description="Image of the lost shipment (nullable, image, mimes:jpg,jpeg,png, max:2048)",
+     *                 ),
+     *             ),
+     *         ),
+     *     ),
+     *     @OA\Response(
+     *         response=200,
+     *         description="Lost report logged; lifecycle ended.",
+     *     ),
+     *     @OA\Response(
+     *         response=422,
+     *         description="Cannot report lost on a delivered shipment.",
+     *     ),
+     *     @OA\Response(
+     *         response=500,
+     *         description="Error processing lost report.",
+     *     ),
+     *     security={{"bearerAuth":{}}}
+     * )
+     */
+    public function handle_lost(Request $request)
+    {
+        $request->validate([
+            'tracking_no' => 'required|exists:shipments,tracking_no',
+            'notes'       => 'required|string',
+            'image'       => 'nullable|image|mimes:jpg,jpeg,png|max:2048',
+        ]);
+        DB::beginTransaction();
+        try {
+            $shipment = Shipment::where('tracking_no', $request->tracking_no)->firstOrFail();
+            if (strtolower($shipment->coreStatus()->name) === 'delivered') {
+                return sendResponse(
+                    'Cannot report lost on a delivered shipment.',
+                    [],
+                    false,
+                    [],
+                    422
+                );
+            }
+            $path = null;
+            if ($request->hasFile('image')) {
+                $path = uploadFile($request->file('image'), 'public/abnormalities');;
+               
+
+            }
+            $log = Abnormality::create([
+                'shipment_tracking_no'   => $shipment->tracking_no,
+                'type'       => 'LOST',
+                'notes'      => $request->notes,
+                'image_path' => $path,
+            ]);
+            if ($shipment->shipment_information) {
+                $info = $shipment->shipment_information;
+                $shipment->in_exception  = false;
+                $info->in_warehouse   = false;
+                $info->lifecycle_end  = true;
+                $info->save();
+            }
+            $statusKey = ShipmentStatusEnum::LOST;
+            shipmentHistory([
+                'shipment_id'    => $shipment->id,
+                'status'      => status($statusKey)['label'],
+                'description' => 'Parcel marked as LOST. [' . $request->notes . ']',
+            ]);
+            updateShipmentStatus($shipment->id, status($statusKey)['label']);
+            DB::commit();
+            return sendResponse('Lost report logged; lifecycle ended.', []);
+        } catch (Exception $e) {
+            DB::rollBack();
+            return sendResponse(
+                'Error processing lost report.',
+                [],
+                false,
+                [$e->getMessage()],
+                500
+            );
+        }
+    }
+
+    /**
+     * @OA\Post(
+     *     path="/abnormalities/handle_missort",
+     *     summary="Report a missorted shipment.",
+     *     tags={"Other"},
+     *     @OA\RequestBody(
+     *         required=true,
+     *         @OA\MediaType(
+     *             mediaType="multipart/form-data",
+     *             @OA\Schema(
+     *                 @OA\Property(
+     *                     property="tracking_no",
+     *                     type="string",
+     *                     description="Shipment tracking number (required, exists:shipments,tracking_no)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="notes",
+     *                     type="string",
+     *                     description="Notes about the missorted shipment (required, string)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="image",
+     *                     type="file",
+     *                     description="Image of the missorted shipment (required)",
+     *                 ),
+     *             ),
+     *         ),
+     *     ),
+     *     @OA\Response(
+     *         response=200,
+     *         description="Miss-sort logged; parcel set to redispatch.",
+     *     ),
+     *     @OA\Response(
+     *         response=422,
+     *         description="Cannot miss-sort a delivered shipment.",
+     *     ),
+     *     @OA\Response(
+     *         response=500,
+     *         description="Error processing miss-sort report.",
+     *     ),
+     *     security={{"bearerAuth":{}}}
+     * )
+     */
+    public function handle_missort(Request $request)
+    {
+        $request->validate([
+            'tracking_no' => 'required|exists:shipments,tracking_no',
+            'notes'       => 'required|string',
+            'image'       => 'required',
+        ]);
+        DB::beginTransaction();
+        try {
+            $shipment = Shipment::where('tracking_no', $request->tracking_no)->firstOrFail();
+            if (strtolower($shipment->coreStatus()->name) === 'delivered') {
+                return sendResponse(
+                    'Cannot miss‑sort a delivered shipment.',
+                    [],
+                    false,
+                    [],
+                    422
+                );
+            }
+            $path = uploadFile($request->file('image'), 'public/abnormalities');;
+            $log = Abnormality::create([
+                'shipment_tracking_no'   => $shipment->tracking_no,
+                'type'       => 'MISS_SORT',
+                'notes'      => $request->notes,
+                'image_path' => $path,
+            ]);
+            $shipment->in_exception = true;
+            $shipment->save();
+            $statusKey = ShipmentStatusEnum::REDISPATCH;
+            shipmentHistory([
+                'shipment_id'    => $shipment->id,
+                'status'      => status($statusKey)['label'],
+                'description' => 'Parcel miss‑sorted: ' . $request->notes,
+                'type'        => 'MISS_SORT',
+            ]);
+            updateShipmentStatus($shipment->id, status($statusKey)['label']);
+            DB::commit();
+            return sendResponse('Miss‑sort logged; parcel set to redispatch.', []);
+        } catch (Exception $e) {
+            DB::rollBack();
+            return sendResponse(
+                'Error processing miss‑sort report.',
+                [],
+                false,
+                [$e->getMessage()],
+                500
+            );
+        }
+    }
+
+    /**
+     * @OA\Post(
+     *     path="/abnormalities/handle_damaged",
+     *     summary="Report a damaged shipment.",
+     *     tags={"Other"},
+     *     @OA\RequestBody(
+     *         required=true,
+     *         @OA\MediaType(
+     *             mediaType="multipart/form-data",
+     *             @OA\Schema(
+     *                 @OA\Property(
+     *                     property="tracking_no",
+     *                     type="string",
+     *                     description="Shipment tracking number (required, exists:shipments,tracking_no)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="subtype",
+     *                     type="string",
+     *                     description="Damage subtype (required)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="notes",
+     *                     type="string",
+     *                     description="Notes about the damaged shipment (required, string)",
+     *                 ),
+     *                 @OA\Property(
+     *                     property="image",
+     *                     type="file",
+     *                     description="Image of the damaged shipment (required)",
+     *                 ),
+     *             ),
+     *         ),
+     *     ),
+     *     @OA\Response(
+     *         response=200,
+     *         description="Damage report recorded; action: {statusKey}.",
+     *     ),
+     *     @OA\Response(
+     *         response=422,
+     *         description="Cannot report damage on a delivered shipment.",
+     *     ),
+     *     @OA\Response(
+     *         response=500,
+     *         description="Error processing damage report.",
+     *     ),
+     *     security={{"bearerAuth":{}}}
+     * )
+     */
+    public function handle_damaged(Request $request)
+    {
+        $request->validate([
+            'tracking_no' => 'required|exists:shipments,tracking_no',
+            'subtype'     => 'required',
+            'notes'       => 'required|string',
+            'image'       => 'required',
+        ]);
+        DB::beginTransaction();
+        try {
+            $shipment   = Shipment::where('tracking_no', $request->tracking_no)->firstOrFail();
+            $subtype = $request->subtype;
+            if (strtolower($shipment->coreStatus()->name) === 'delivered') {
+                return sendResponse(
+                    'Cannot report damage on a delivered shipment.',
+                    [],
+                    false,
+                    [],
+                    422
+                );
+            }
+            switch ($subtype) {
+                case 'appearance':
+                case 'light':
+                    $statusKey = ShipmentStatusEnum::REDISPATCH;
+                    $endCycle  = false;
+                    break;
+                case 'heavy':
+                case 'content':
+                    $statusKey = ShipmentStatusEnum::DAMAGED;
+                    $endCycle  = true;
+                    break;
+                default:
+                    throw new Exception('Invalid damage subtype.');
+            }
+            $path = uploadFile($request->file('image'), 'public/abnormalities');;
+            $log = Abnormality::create([
+                'shipment_tracking_no'   => $shipment->tracking_no,
+                'type'       => 'DAMAGED',
+                'subtype'    => $subtype,
+                'notes'      => $request->notes,
+                'image_path' => $path,
+            ]);
+            if ($shipment->shipment_information) {
+                $info = $shipment->shipment_information;
+                $shipment->in_exception  = ($statusKey === 'REDISPATCH');
+                $info->lifecycle_end = $endCycle;
+                $info->save();
+            }
+            $descriptionMap = [
+                'appearance' => 'Appearance damage',
+                'light'      => 'Light items lost',
+                'heavy'      => 'Heavy items lost',
+                'content'    => 'Content damage',
+            ];
+            $description = $descriptionMap[$subtype] . ': ' . $request->notes;
+            shipmentHistory([
+                'shipment_id'    => $shipment->id,
+                'status'      => status($statusKey)['label'],
+                'description' => $description,
+                'type'        => 'DAMAGED',
+            ]);
+            updateShipmentStatus($shipment->id, status($statusKey)['label']);
+            DB::commit();
+            return sendResponse("Damage report recorded; action: {$statusKey}.", []);
+        } catch (Exception $e) {
+            DB::rollBack();
+            return sendResponse(
+                'Error processing damage report.',
+                [],
+                false,
+                [$e->getMessage()],
+                500
+            );
+        }
+    }
+}

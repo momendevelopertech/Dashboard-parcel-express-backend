@@ -1,0 +1,123 @@
+
+
+=== services/ConsigneeLocationService.php ===
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Consignee;
+
+class ConsigneeLocationService
+{
+    public function setLatLng(Consignee $consignee)
+    {
+        if ($consignee->latitude && $consignee->longitude) {
+            return;
+        }
+
+        $locationSources = [
+            'place' => $consignee->place,
+            'state' => $consignee->state,
+            'governorate' => $consignee->governorate
+        ];
+
+        foreach ($locationSources as $source) {
+            if ($source && isset($source->lat, $source->lng)) {
+                $consignee->latitude = $source->lat;
+                $consignee->longitude = $source->lng;
+                return;
+            }
+        }
+    }
+}
+
+
+=== services/OFDService.php ===
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Shipment;
+use App\Models\User;
+
+class OFDService
+{
+    public function remainingExceptionShipments(User $driver)
+    {
+        return Shipment::whereHas('driverAssignments', function ($query) use ($driver) {
+            $query->where('driver_id', $driver->id);
+        })
+            ->whereHas('shipmentHistories', function ($query) {
+                $query->where('status', 'signed');
+            })
+            ->get();
+    }
+
+    public function remainingOFDShipments(User $driver)
+    {
+        return Shipment::whereHas('driverAssignments', function ($query) use ($driver) {
+            $query->where('driver_id', $driver->id);
+        })
+            ->whereHas('shipmentHistories', function ($query) {
+                $query->where('status', 'out_for_delivery');
+            })
+            ->get();
+    }
+}
+
+
+=== services/ParcelShelfService.php ===
+
+<?php
+
+namespace App\Services;
+
+use App\Models\AssignShipmentToShelf;
+
+class ParcelShelfService
+{
+    /**
+     * Determine if a parcel is currently on any shelf.
+     *
+     * @param  string  $trackingNo
+     * @return bool
+     */
+    public function isOnShelf(string $trackingNo): bool
+    {
+        return AssignShipmentToShelf::where('tracking_no', $trackingNo)->exists();
+    }
+
+    /**
+     * Retrieve the shelf assignment record for a parcel, if any.
+     *
+     * @param  string  $trackingNo
+     * @return \App\Models\AssignShipmentToShelf|null
+     */
+    public function getAssignment(string $trackingNo): ?AssignShipmentToShelf
+    {
+        return AssignShipmentToShelf::with('shelf')
+            ->where('trackingno', $trackingNo)
+            ->first();
+    }
+
+    /**
+     * Remove a parcel’s shelf assignment.
+     *
+     * @param  string  $trackingNo
+     * @return bool  True if removed, false if no assignment found.
+     *
+     * @throws \Illuminate\Database\Eloquent\ModelNotFoundException
+     */
+    public function removeFromShelf(string $trackingNo): bool
+    {
+        $assignment = AssignShipmentToShelf::where('trackingno', $trackingNo)->first();
+
+        if (! $assignment) {
+            return false;
+        }
+
+        return $assignment->delete();
+    }
+}
